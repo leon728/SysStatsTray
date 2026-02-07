@@ -1,10 +1,18 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 
 namespace SysStatsTray;
+
+internal static class NativeMethods
+{
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool DestroyIcon(IntPtr hIcon);
+}
 
 internal static class Program
 {
@@ -21,7 +29,7 @@ internal class TrayApplicationContext : ApplicationContext
     private NotifyIcon? _notifyIcon;
     private Thread? _updaterThread;
     private volatile bool _running = true;
-    private volatile int _updateIntervalMs = 2000;
+    private volatile int _updateIntervalMs = 1000;
     
     // Configuration
     private const int BarWidth = 48;
@@ -34,6 +42,12 @@ internal class TrayApplicationContext : ApplicationContext
 
     private PerformanceCounter? _cpuCounter;
     private PerformanceCounter? _ramCounter;
+
+    /// <summary>HICON we gave to the current tray icon. Icon.FromHandle does not own it; we must DestroyIcon when replacing.</summary>
+    private IntPtr _currentIconHandle = IntPtr.Zero;
+    private readonly object _iconLock = new();
+    /// <summary>Reused bitmap for tray icon updates to avoid allocating a new Bitmap every tick.</summary>
+    private Bitmap? _reusedIconBitmap;
 
     public TrayApplicationContext()
     {
@@ -89,10 +103,10 @@ internal class TrayApplicationContext : ApplicationContext
         return (cpu, ram);
     }
 
-    private Bitmap CreateDualBarIcon(float cpuPercent, float ramPercent)
+    /// <summary>Draws the dual CPU/RAM bar into an existing bitmap (size BarHeight x BarHeight). Reused to avoid allocations.</summary>
+    private static void DrawDualBarToBitmap(Bitmap bitmap, float cpuPercent, float ramPercent)
     {
         int size = BarHeight;
-        var bitmap = new Bitmap(size, size);
         using (var g = Graphics.FromImage(bitmap))
         {
             g.Clear(Color.Transparent);
@@ -106,40 +120,39 @@ internal class TrayApplicationContext : ApplicationContext
             int x1Cpu = margin + barWidth - 1;
             int fillCpu = Math.Max(0, Math.Min(h, (int)(h * cpuPercent / 100)));
             int yTopCpu = size - margin - fillCpu;
-            
-            g.FillRectangle(new SolidBrush(ColorCpu), x0Cpu, yTopCpu, barWidth, fillCpu);
+
+            using (var brushCpu = new SolidBrush(ColorCpu))
+                g.FillRectangle(brushCpu, x0Cpu, yTopCpu, barWidth, fillCpu);
             using (var pen = new Pen(ColorBorder, 2))
-            {
                 g.DrawRectangle(pen, x0Cpu, margin, barWidth, h);
-            }
 
             // Right bar (RAM)
             int x0Ram = x1Cpu + 1 + BarGap;
-            int x1Ram = x0Ram + barWidth - 1;
             int fillRam = Math.Max(0, Math.Min(h, (int)(h * ramPercent / 100)));
             int yTopRam = size - margin - fillRam;
-            
-            g.FillRectangle(new SolidBrush(ColorRam), x0Ram, yTopRam, barWidth, fillRam);
-            using (var pen = new Pen(ColorBorder, 2))
-            {
-                g.DrawRectangle(pen, x0Ram, margin, barWidth, h);
-            }
-        }
 
-        return bitmap;
+            using (var brushRam = new SolidBrush(ColorRam))
+                g.FillRectangle(brushRam, x0Ram, yTopRam, barWidth, fillRam);
+            using (var pen = new Pen(ColorBorder, 2))
+                g.DrawRectangle(pen, x0Ram, margin, barWidth, h);
+        }
     }
 
     private void CreateNotifyIcon()
     {
         var (cpu, ram) = GetStats();
-        var icon = CreateDualBarIcon(cpu, ram);
-
-        _notifyIcon = new NotifyIcon
+        _reusedIconBitmap = new Bitmap(BarHeight, BarHeight);
+        DrawDualBarToBitmap(_reusedIconBitmap, cpu, ram);
+        lock (_iconLock)
         {
-            Icon = Icon.FromHandle(icon.GetHicon()),
-            Text = $"CPU: {cpu:F1}%  RAM: {ram:F1}%",
-            Visible = true
-        };
+            _currentIconHandle = _reusedIconBitmap.GetHicon();
+            _notifyIcon = new NotifyIcon
+            {
+                Icon = Icon.FromHandle(_currentIconHandle),
+                Text = $"CPU: {cpu:F1}%  RAM: {ram:F1}%",
+                Visible = true
+            };
+        }
 
         var contextMenu = new ContextMenuStrip();
         contextMenu.Items.Add("Open Task Manager", null, OpenTaskManager);
@@ -151,6 +164,7 @@ internal class TrayApplicationContext : ApplicationContext
         contextMenu.Items.Add("Exit", null, Exit);
 
         _notifyIcon.ContextMenuStrip = contextMenu;
+        UpdateMenuCheckStates();
         _notifyIcon.DoubleClick += (s, e) => OpenTaskManager(null, null);
     }
 
@@ -164,6 +178,8 @@ internal class TrayApplicationContext : ApplicationContext
         {
             _updateIntervalMs = intervalMs;
             UpdateMenuCheckStates();
+            // Reclaim memory
+            GC.Collect();
         };
         return item;
     }
@@ -182,7 +198,7 @@ internal class TrayApplicationContext : ApplicationContext
                     "Update: 1s" => 1000,
                     "Update: 2s" => 2000,
                     "Update: 3s" => 3000,
-                    _ => 2000
+                    _ => 1000
                 };
                 menuItem.Checked = (interval == _updateIntervalMs);
             }
@@ -206,13 +222,18 @@ internal class TrayApplicationContext : ApplicationContext
             try
             {
                 var (cpu, ram) = GetStats();
-                if (_notifyIcon != null)
+                if (_notifyIcon != null && _reusedIconBitmap != null)
                 {
-                    var icon = CreateDualBarIcon(cpu, ram);
-                    var newIcon = Icon.FromHandle(icon.GetHicon());
-                    
-                    _notifyIcon.Icon = newIcon;
-                    _notifyIcon.Text = $"CPU: {cpu:F1}%  RAM: {ram:F1}%";
+                    DrawDualBarToBitmap(_reusedIconBitmap, cpu, ram);
+                    IntPtr hIcon = _reusedIconBitmap.GetHicon();
+                    lock (_iconLock)
+                    {
+                        if (_currentIconHandle != IntPtr.Zero)
+                            NativeMethods.DestroyIcon(_currentIconHandle);
+                        _currentIconHandle = hIcon;
+                        _notifyIcon.Icon = Icon.FromHandle(_currentIconHandle);
+                        _notifyIcon.Text = $"CPU: {cpu:F1}%  RAM: {ram:F1}%";
+                    }
                 }
             }
             catch { }
@@ -240,6 +261,16 @@ internal class TrayApplicationContext : ApplicationContext
     private void Exit(object? sender, EventArgs? e)
     {
         _running = false;
+        lock (_iconLock)
+        {
+            if (_currentIconHandle != IntPtr.Zero)
+            {
+                NativeMethods.DestroyIcon(_currentIconHandle);
+                _currentIconHandle = IntPtr.Zero;
+            }
+        }
+        _reusedIconBitmap?.Dispose();
+        _reusedIconBitmap = null;
         _notifyIcon?.Dispose();
         _cpuCounter?.Dispose();
         _ramCounter?.Dispose();
