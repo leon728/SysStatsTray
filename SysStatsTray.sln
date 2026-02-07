@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SysStatsTray", "SysStatsTray.csproj", "{1F17D39B-7437-E617-79B1-9FFE7E7882E1}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{1F17D39B-7437-E617-79B1-9FFE7E7882E1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1F17D39B-7437-E617-79B1-9FFE7E7882E1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1F17D39B-7437-E617-79B1-9FFE7E7882E1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1F17D39B-7437-E617-79B1-9FFE7E7882E1}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {07361329-06E3-45AC-A089-EF8D80B80624}
+	EndGlobalSection
+EndGlobal
