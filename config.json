@@ -1,0 +1,11 @@
+{
+  "DebugPrint": false,
+  "UpdateIntervalMs": 1000,
+  "UpdateIntervalOptions": [ 1000, 2000, 3000 ],
+  "BarHeight": 32,
+  "BarGap": 3,
+  "ColorCpu": "#FA55DC82",
+  "ColorRam": "#FA4696FA",
+  "ColorBorder": "#FFFFFFFF",
+  "BarUpdateThreshold": 3
+}

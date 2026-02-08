@@ -60,18 +60,17 @@ internal static class Program
 
 internal class TrayApplicationContext : ApplicationContext
 {
+    private readonly AppConfig _config = AppConfig.Load();
     private NotifyIcon? _notifyIcon;
     private Thread? _updaterThread;
     private volatile bool _running = true;
-    private volatile int _updateIntervalMs = 1000;
-    
-    // Configuration
-    private const int BarHeight = 32;
-    private const int BarGap = 3;
-    
-    private static readonly Color ColorCpu = Color.FromArgb(250, 85, 220, 130);
-    private static readonly Color ColorRam = Color.FromArgb(250, 70, 150, 250);
-    private static readonly Color ColorBorder = Color.White;
+    private volatile int _updateIntervalMs;
+
+    private int BarHeight;
+    private int BarGap;
+    private Color ColorCpu;
+    private Color ColorRam;
+    private Color ColorBorder;
 
     private static float _lastCpuPercent = 999;
     private static float _lastRamPercent = 999;
@@ -98,6 +97,12 @@ internal class TrayApplicationContext : ApplicationContext
 
     public TrayApplicationContext()
     {
+        _updateIntervalMs = _config.UpdateIntervalMs;
+        BarHeight = _config.BarHeight;
+        BarGap = _config.BarGap;
+        ColorCpu = _config.ParseColor(_config.ColorCpu);
+        ColorRam = _config.ParseColor(_config.ColorRam);
+        ColorBorder = _config.ParseColor(_config.ColorBorder);
         try
         {
             InitializePerformanceCounters();
@@ -163,11 +168,11 @@ internal class TrayApplicationContext : ApplicationContext
     }
 
     /// <summary>Draws the dual CPU/RAM bar into an existing bitmap (size BarHeight x BarHeight). Reused to avoid allocations.</summary>
-    private static void DrawDualBarToBitmap(Bitmap bitmap, float cpuPercent, float ramPercent)
+    private void DrawDualBarToBitmap(Bitmap bitmap, float cpuPercent, float ramPercent)
     {
         // Skip drawing if the values are too similar to the last draw
-        if (   Math.Abs(cpuPercent - _lastCpuPercent) < 3f
-            && Math.Abs(ramPercent - _lastRamPercent) < 3f)
+        if (   Math.Abs(cpuPercent - _lastCpuPercent) < _config.BarUpdateThreshold
+            && Math.Abs(ramPercent - _lastRamPercent) < _config.BarUpdateThreshold)
         {
             return;
         }
@@ -218,9 +223,11 @@ internal class TrayApplicationContext : ApplicationContext
         var contextMenu = new ContextMenuStrip();
         contextMenu.Items.Add("Open Task Manager", null, OpenTaskManager);
         contextMenu.Items.Add(new ToolStripSeparator());
-        contextMenu.Items.Add(CreateUpdateIntervalMenu(1000, "Update: 1s"));
-        contextMenu.Items.Add(CreateUpdateIntervalMenu(2000, "Update: 2s"));
-        contextMenu.Items.Add(CreateUpdateIntervalMenu(3000, "Update: 3s"));
+        foreach (int intervalMs in _config.UpdateIntervalOptions)
+        {
+            string label = intervalMs >= 1000 ? $"Update: {intervalMs / 1000}s" : $"Update: {intervalMs}ms";
+            contextMenu.Items.Add(CreateUpdateIntervalMenu(intervalMs, label));
+        }
         contextMenu.Items.Add(new ToolStripSeparator());
         contextMenu.Items.Add("Exit", null, Exit);
 
@@ -233,7 +240,8 @@ internal class TrayApplicationContext : ApplicationContext
     {
         var item = new ToolStripMenuItem(label)
         {
-            CheckOnClick = true
+            CheckOnClick = true,
+            Tag = intervalMs
         };
         item.Click += (s, e) =>
         {
@@ -252,15 +260,8 @@ internal class TrayApplicationContext : ApplicationContext
         var items = _notifyIcon.ContextMenuStrip.Items;
         foreach (var item in items)
         {
-            if (item is ToolStripMenuItem menuItem && menuItem.Text != null && menuItem.Text.StartsWith("Update:"))
+            if (item is ToolStripMenuItem menuItem && menuItem.Tag is int interval)
             {
-                int interval = menuItem.Text switch
-                {
-                    "Update: 1s" => 1000,
-                    "Update: 2s" => 2000,
-                    "Update: 3s" => 3000,
-                    _ => 1000
-                };
                 menuItem.Checked = (interval == _updateIntervalMs);
             }
         }
@@ -293,13 +294,13 @@ internal class TrayApplicationContext : ApplicationContext
                             NativeMethods.DestroyIcon(_currentIconHandle);
                         _currentIconHandle = hIcon;
                         _notifyIcon.Icon = Icon.FromHandle(_currentIconHandle);
-
                         // _notifyIcon.Text = $"CPU: {cpu:F1}%\r\nRAM: {ramPercent:F1}% ({usedGB:F1}/{totalGB:F1} GB)\r\nUptime: {GetUptimeString()}";
-                        // _notifyIcon.Text = $"CPU: {cpu:F1}%\r\nRAM: {ramPercent:F1}% ({usedGB:F1}/{totalGB:F1} GB)";
-                        _notifyIcon.Text = $"CPU: {Math.Round(cpu)}%\r\nRAM: {Math.Round(ramPercent)}% ({usedGB:F1}/{totalGB:F1} GB)";
-
-                        // Console.Out.WriteLine($"CPU: {cpu:F1}% | RAM: {ramPercent:F1}% ({usedGB:F1}/{totalGB:F1} GB) | Uptime: {GetUptimeString()}");
+                        _notifyIcon.Text = $"CPU: {cpu:F0}%\r\nRAM: {ramPercent:F0}% ({usedGB:F1}/{totalGB:F1} GB)"; // F0 format for integers, F1 format for .1f
                     }
+                }
+                if (_config.DebugPrint)
+                {
+                    Console.Out.WriteLine($"CPU: {cpu,4:F1}% | RAM: {ramPercent,4:F1}% ({usedGB:F1}/{totalGB:F1} GB)");
                 }
             }
             catch { }
