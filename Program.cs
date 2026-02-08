@@ -7,8 +7,32 @@ using System.Windows.Forms;
 
 namespace SysStatsTray;
 
+[StructLayout(LayoutKind.Sequential)]
+internal struct MEMORYSTATUSEX
+{
+    public uint dwLength;
+    public uint dwMemoryLoad;
+    public ulong ullTotalPhys;
+    public ulong ullAvailPhys;
+    public ulong ullTotalPageFile;
+    public ulong ullAvailPageFile;
+    public ulong ullTotalVirtual;
+    public ulong ullAvailVirtual;
+    public ulong ullAvailExtendedVirtual;
+}
+
 internal static class NativeMethods
 {
+    internal const int ATTACH_PARENT_PROCESS = -1;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool AttachConsole(int dwProcessId);
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool DestroyIcon(IntPtr hIcon);
@@ -19,6 +43,16 @@ internal static class Program
     [STAThread]
     static void Main()
     {
+        // WinExe has no console; attach to parent (e.g. terminal from "dotnet run") so Console.Out is visible
+        if (NativeMethods.AttachConsole(NativeMethods.ATTACH_PARENT_PROCESS))
+        {
+            try
+            {
+                Console.SetOut(new System.IO.StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+            }
+            catch { /* ignore if stdout not available */ }
+        }
+
         ApplicationConfiguration.Initialize();
         Application.Run(new TrayApplicationContext());
     }
@@ -32,16 +66,29 @@ internal class TrayApplicationContext : ApplicationContext
     private volatile int _updateIntervalMs = 1000;
     
     // Configuration
-    private const int BarWidth = 48;
-    private const int BarHeight = 64;
-    private const int BarGap = 5;
+    private const int BarHeight = 32;
+    private const int BarGap = 3;
     
     private static readonly Color ColorCpu = Color.FromArgb(250, 85, 220, 130);
     private static readonly Color ColorRam = Color.FromArgb(250, 70, 150, 250);
     private static readonly Color ColorBorder = Color.White;
 
+    private static float _lastCpuPercent = 999;
+    private static float _lastRamPercent = 999;
+
+    private static string GetUptimeString()
+    {
+        long totalMs = Math.Max(0, Environment.TickCount64);
+        int days = (int)(totalMs / (24 * 60 * 60 * 1000));
+        totalMs %= (24 * 60 * 60 * 1000);
+        int hours = (int)(totalMs / (60 * 60 * 1000));
+        totalMs %= (60 * 60 * 1000);
+        int minutes = (int)(totalMs / (60 * 1000));
+        // return $"{days} D {hours} H {minutes} M";
+        return $"{days} days, {hours}:{minutes}";
+    }
+
     private PerformanceCounter? _cpuCounter;
-    private PerformanceCounter? _ramCounter;
 
     /// <summary>HICON we gave to the current tray icon. Icon.FromHandle does not own it; we must DestroyIcon when replacing.</summary>
     private IntPtr _currentIconHandle = IntPtr.Zero;
@@ -66,25 +113,30 @@ internal class TrayApplicationContext : ApplicationContext
 
     private void InitializePerformanceCounters()
     {
+        // Task Manager (Windows 8+) uses "Processor Information" / "% Processor Utility".
+        // Fall back to "Processor" / "% Processor Time" on older or constrained systems.
         try
         {
-            _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total", true);
+            _cpuCounter = new PerformanceCounter("Processor Information", "% Processor Utility", "_Total", true);
             _ = _cpuCounter.NextValue(); // Warm up
         }
-        catch { /* CPU counter may not be available */ }
-
-        try
+        catch
         {
-            _ramCounter = new PerformanceCounter("Memory", "% Committed Bytes In Use", null, true);
-            _ = _ramCounter.NextValue(); // Warm up
+            try
+            {
+                _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total", true);
+                _ = _cpuCounter.NextValue();
+            }
+            catch { /* CPU counter may not be available */ }
         }
-        catch { /* RAM counter may not be available */ }
     }
 
-    private (float cpu, float ram) GetStats()
+    private (float cpu, float ramPercent, float usedGB, float totalGB) GetStats()
     {
         float cpu = 0f;
-        float ram = 0f;
+        float ramPercent = 0f;
+        float usedGB = 0f;
+        float totalGB = 0f;
 
         try
         {
@@ -93,25 +145,42 @@ internal class TrayApplicationContext : ApplicationContext
         }
         catch { }
 
+        // Use physical memory % (matches Task Manager "In use"), not commit charge.
         try
         {
-            if (_ramCounter != null)
-                ram = _ramCounter.NextValue();
+            var mem = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
+            if (NativeMethods.GlobalMemoryStatusEx(ref mem))
+            {
+                totalGB = (float)(mem.ullTotalPhys / (1024.0 * 1024.0 * 1024.0));
+                usedGB = (float)((mem.ullTotalPhys - mem.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0));
+                // ramPercent = mem.dwMemoryLoad;
+                ramPercent = usedGB / totalGB * 100;
+            }
         }
         catch { }
 
-        return (cpu, ram);
+        return (cpu, ramPercent, usedGB, totalGB);
     }
 
     /// <summary>Draws the dual CPU/RAM bar into an existing bitmap (size BarHeight x BarHeight). Reused to avoid allocations.</summary>
     private static void DrawDualBarToBitmap(Bitmap bitmap, float cpuPercent, float ramPercent)
     {
+        // Skip drawing if the values are too similar to the last draw
+        if (   Math.Abs(cpuPercent - _lastCpuPercent) < 3f
+            && Math.Abs(ramPercent - _lastRamPercent) < 3f)
+        {
+            return;
+        }
+
+        _lastCpuPercent = cpuPercent;
+        _lastRamPercent = ramPercent;
+
         int size = BarHeight;
         using (var g = Graphics.FromImage(bitmap))
         {
             g.Clear(Color.Transparent);
 
-            int margin = 2;
+            int margin = 1;
             int h = size - 2 * margin;
             int barWidth = (size - 2 * margin - BarGap) / 2;
 
@@ -123,7 +192,7 @@ internal class TrayApplicationContext : ApplicationContext
 
             using (var brushCpu = new SolidBrush(ColorCpu))
                 g.FillRectangle(brushCpu, x0Cpu, yTopCpu, barWidth, fillCpu);
-            using (var pen = new Pen(ColorBorder, 2))
+            using (var pen = new Pen(ColorBorder, 1))
                 g.DrawRectangle(pen, x0Cpu, margin, barWidth, h);
 
             // Right bar (RAM)
@@ -133,26 +202,18 @@ internal class TrayApplicationContext : ApplicationContext
 
             using (var brushRam = new SolidBrush(ColorRam))
                 g.FillRectangle(brushRam, x0Ram, yTopRam, barWidth, fillRam);
-            using (var pen = new Pen(ColorBorder, 2))
+            using (var pen = new Pen(ColorBorder, 1))
                 g.DrawRectangle(pen, x0Ram, margin, barWidth, h);
         }
     }
 
     private void CreateNotifyIcon()
     {
-        var (cpu, ram) = GetStats();
         _reusedIconBitmap = new Bitmap(BarHeight, BarHeight);
-        DrawDualBarToBitmap(_reusedIconBitmap, cpu, ram);
-        lock (_iconLock)
+        _notifyIcon = new NotifyIcon
         {
-            _currentIconHandle = _reusedIconBitmap.GetHicon();
-            _notifyIcon = new NotifyIcon
-            {
-                Icon = Icon.FromHandle(_currentIconHandle),
-                Text = $"CPU: {cpu:F1}%  RAM: {ram:F1}%",
-                Visible = true
-            };
-        }
+            Visible = true
+        };
 
         var contextMenu = new ContextMenuStrip();
         contextMenu.Items.Add("Open Task Manager", null, OpenTaskManager);
@@ -164,8 +225,8 @@ internal class TrayApplicationContext : ApplicationContext
         contextMenu.Items.Add("Exit", null, Exit);
 
         _notifyIcon.ContextMenuStrip = contextMenu;
-        UpdateMenuCheckStates();
         _notifyIcon.DoubleClick += (s, e) => OpenTaskManager(null, null);
+        UpdateMenuCheckStates();
     }
 
     private ToolStripMenuItem CreateUpdateIntervalMenu(int intervalMs, string label)
@@ -221,10 +282,10 @@ internal class TrayApplicationContext : ApplicationContext
         {
             try
             {
-                var (cpu, ram) = GetStats();
+                var (cpu, ramPercent, usedGB, totalGB) = GetStats();
                 if (_notifyIcon != null && _reusedIconBitmap != null)
                 {
-                    DrawDualBarToBitmap(_reusedIconBitmap, cpu, ram);
+                    DrawDualBarToBitmap(_reusedIconBitmap, cpu, ramPercent);
                     IntPtr hIcon = _reusedIconBitmap.GetHicon();
                     lock (_iconLock)
                     {
@@ -232,7 +293,12 @@ internal class TrayApplicationContext : ApplicationContext
                             NativeMethods.DestroyIcon(_currentIconHandle);
                         _currentIconHandle = hIcon;
                         _notifyIcon.Icon = Icon.FromHandle(_currentIconHandle);
-                        _notifyIcon.Text = $"CPU: {cpu:F1}%  RAM: {ram:F1}%";
+
+                        // _notifyIcon.Text = $"CPU: {cpu:F1}%\r\nRAM: {ramPercent:F1}% ({usedGB:F1}/{totalGB:F1} GB)\r\nUptime: {GetUptimeString()}";
+                        // _notifyIcon.Text = $"CPU: {cpu:F1}%\r\nRAM: {ramPercent:F1}% ({usedGB:F1}/{totalGB:F1} GB)";
+                        _notifyIcon.Text = $"CPU: {Math.Round(cpu)}%\r\nRAM: {Math.Round(ramPercent)}% ({usedGB:F1}/{totalGB:F1} GB)";
+
+                        // Console.Out.WriteLine($"CPU: {cpu:F1}% | RAM: {ramPercent:F1}% ({usedGB:F1}/{totalGB:F1} GB) | Uptime: {GetUptimeString()}");
                     }
                 }
             }
@@ -273,7 +339,6 @@ internal class TrayApplicationContext : ApplicationContext
         _reusedIconBitmap = null;
         _notifyIcon?.Dispose();
         _cpuCounter?.Dispose();
-        _ramCounter?.Dispose();
         ExitThread();
     }
 }
