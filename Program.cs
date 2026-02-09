@@ -118,22 +118,18 @@ internal class TrayApplicationContext : ApplicationContext
 
     private void InitializePerformanceCounters()
     {
-        // Task Manager (Windows 8+) uses "Processor Information" / "% Processor Utility".
-        // Fall back to "Processor" / "% Processor Time" on older or constrained systems.
         try
         {
-            _cpuCounter = new PerformanceCounter("Processor Information", "% Processor Utility", "_Total", true);
+            // "% Processor Time" (0-100% for _Total); matches the 0-100% scale users expect and Task Manager's classic view.
+            _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total", true);
+
+            // // "% Processor Utility" (Task Manager on Win8+) can exceed 100% with Turbo Boost
+            // // You can clamp it to 0-100% by using: cpu = Math.Clamp(_cpuCounter.NextValue(), 0f, 100f);
+            // _cpuCounter = new PerformanceCounter("Processor Information", "% Processor Utility", "_Total", true);
+
             _ = _cpuCounter.NextValue(); // Warm up
         }
-        catch
-        {
-            try
-            {
-                _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total", true);
-                _ = _cpuCounter.NextValue();
-            }
-            catch { /* CPU counter may not be available */ }
-        }
+        catch { /* CPU counter may not be available */ }
     }
 
     private (float cpu, float ramPercent, float usedGB, float totalGB) GetStats()
